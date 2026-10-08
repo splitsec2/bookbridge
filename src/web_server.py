@@ -49,6 +49,7 @@ from src.services.diagnostics import setup_diagnostics_logging
 from src.services import whats_new
 from src.api.api_clients import ABS_DISABLED_SENTINEL, is_abs_disabled_value
 from src.api.kosync_server import kosync_sync_bp, kosync_admin_bp, init_kosync_server, signal_manifest_rebuild
+from src.api.admin_api import admin_api_bp, init_admin_api
 from src.api.hardcover_routes import hardcover_bp, init_hardcover_routes
 from src.api.storygraph_routes import storygraph_bp, init_storygraph_routes
 from src.api.bookfusion_upload_client import extract_epub_metadata, _S3_TIMEOUT_LARGE
@@ -432,6 +433,10 @@ def setup_dependencies(app, test_container=None):
     init_storygraph_routes(database_service, container)
     app.register_blueprint(storygraph_bp)
 
+    # Token-authenticated admin API (disabled unless ADMIN_API_TOKEN is set)
+    init_admin_api(database_service, _share_library_with_new_user, _after_user_integrations_saved)
+    app.register_blueprint(admin_api_bp)
+
     logger.info(f"🚀 Web server dependencies initialized (DATA_DIR={DATA_DIR})")
 
 
@@ -796,6 +801,8 @@ def require_login_guard():
     if endpoint in _AUTH_EXEMPT_ENDPOINTS:
         return None
     if request.blueprint == 'kosync':  # device sync API — own auth
+        return None
+    if request.blueprint == 'admin_api':  # bearer-token admin API, own auth
         return None
     user = current_user()
     if user is None:
@@ -1295,6 +1302,12 @@ def _apply_user_integrations(user_id):
         for _tok in ('READEST_ACCESS_TOKEN', 'READEST_REFRESH_TOKEN', 'READEST_TOKEN_EXPIRES_AT'):
             database_service.set_user_credential(user_id, _tok, '')
 
+    _after_user_integrations_saved(user_id)
+
+
+def _after_user_integrations_saved(user_id):
+    """Refresh a user's cached clients after their integrations change, and mirror
+    the primary admin's library-lookup creds to the global settings."""
     try:
         container.user_client_registry().invalidate(user_id)
     except Exception as e:
@@ -1528,6 +1541,26 @@ def account_booklore_libraries():
 _USER_ADMIN_ACTIONS = {'create', 'reset_password', 'toggle_active', 'set_role', 'delete', 'share_library'}
 
 
+
+def _share_library_with_new_user(new_user) -> int:
+    """With share-all-books on, a new account starts with the whole library rather
+    than only books matched from now on. Returns the number of books shared."""
+    if not env_truthy('SHARE_ALL_BOOKS_WITH_ALL_USERS'):
+        return 0
+    try:
+        linked = database_service.backfill_user_books_for_user(new_user.id)
+        logger.info(
+            "🔗 Shared %d existing book(s) with new user '%s' (share-all-books enabled)",
+            linked, sanitize_log_data(new_user.username),
+        )
+        return linked
+    except Exception as share_err:
+        logger.warning(
+            "Could not backfill shared books for new user '%s': %s",
+            sanitize_log_data(new_user.username), share_err, exc_info=True,
+        )
+        return 0
+
 def _apply_user_admin_action(form):
     """Handle a single user-management action (create/reset/toggle/delete).
 
@@ -1552,23 +1585,9 @@ def _apply_user_admin_action(form):
             else:
                 new_user = database_service.create_user(username, password, role=role)
                 message = f"Created user '{username}'"
-                # Share-all-books is about the household seeing one library, so a
-                # new account starts with everything rather than only books matched
-                # from now on.
-                if env_truthy('SHARE_ALL_BOOKS_WITH_ALL_USERS'):
-                    try:
-                        linked = database_service.backfill_user_books_for_user(new_user.id)
-                        logger.info(
-                            "🔗 Shared %d existing book(s) with new user '%s' (share-all-books enabled)",
-                            linked, sanitize_log_data(username),
-                        )
-                        if linked:
-                            message = f"Created user '{username}' and shared {linked} book(s)"
-                    except Exception as share_err:
-                        logger.warning(
-                            "Could not backfill shared books for new user '%s': %s",
-                            sanitize_log_data(username), share_err, exc_info=True,
-                        )
+                linked = _share_library_with_new_user(new_user)
+                if linked:
+                    message = f"Created user '{username}' and shared {linked} book(s)"
         elif action == 'reset_password':
             uid = int(form.get('user_id'))
             new_pw = form.get('password') or ''
